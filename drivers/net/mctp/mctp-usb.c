@@ -7,7 +7,7 @@
 
 #include <uapi/linux/if_arp.h>
 
-#define MAX_URB_LIST_LEN 5
+#define MAX_URB_LIST_LEN 10
 struct mctp_usb {
 	struct usb_device *usbdev;
 	struct usb_interface *intf;

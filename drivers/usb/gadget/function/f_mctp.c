@@ -11,7 +11,7 @@
 
 #include <linux/usb/func_utils.h>
 
-#define MAX_REQS_LEN 5
+#define MAX_REQS_LEN 10
 
 struct f_mctp {
 	struct usb_function function;
@@ -129,10 +129,12 @@ static int mctp_rx_submit(struct f_mctp *mctp, struct usb_ep *ep,
 	int rc = 0;
 
 	if (!skb) {
+		req->buf = NULL;
+
 		skb = netdev_alloc_skb(mctp->dev, MCTP_USB_XFER_SIZE);
 		if (!skb) {
-			pr_warn("%s: failed alloc skb", __func__);
-			return -ENOMEM;
+			pr_warn("%s can't allocate skb", __func__);
+			return -1;
 		}
 
 		req->buf = skb->data;
@@ -140,12 +142,8 @@ static int mctp_rx_submit(struct f_mctp *mctp, struct usb_ep *ep,
 	}
 
 	rc = usb_ep_queue(ep, req, GFP_ATOMIC);
-	if (rc) {
+	if (rc)
 		pr_warn("usb_ep_queue err");
-		kfree(skb);
-		req->context = NULL;
-	}
-
 	return rc;
 }
 
@@ -197,7 +195,9 @@ static void mctp_usbg_handle_rx_urb(struct f_mctp *mctp,
 
 	return;
 err:
+	printk("%s: err", __func__);
 	kfree_skb(skb);
+	req->context = NULL;
 }
 
 static void mctp_usbg_out_ep_complete(struct usb_ep *ep,
@@ -205,47 +205,52 @@ static void mctp_usbg_out_ep_complete(struct usb_ep *ep,
 {
 	struct f_mctp *mctp = ep->driver_data;
 	struct usb_composite_dev *cdev = mctp->function.config->cdev;
-	struct sk_buff *skb = req->context;
 	unsigned long flags;
 	int rc;
 
 	switch (req->status) {
 	case 0:
-		if (skb) {
-			mctp_usbg_handle_rx_urb(mctp, req);
-		}
+		mctp_usbg_handle_rx_urb(mctp, req);
 
+		//dprintk("%s: before list_add_tail", __func__);
 		spin_lock_irqsave(&mctp->rx_spinlock, flags);
 		list_add_tail(&req->list, &mctp->free_rx_reqs);
 		spin_unlock_irqrestore(&mctp->rx_spinlock, flags);
 
+		//printk("%s: before list_empty", __func__);
 		spin_lock_irqsave(&mctp->rx_spinlock, flags);
 		if (!list_empty(&mctp->free_rx_reqs)) {
 			struct usb_request *next_req = list_first_entry(
 				&mctp->free_rx_reqs, struct usb_request, list);
 
+			//printk("%s: before list_del", __func__);
 			list_del(&next_req->list);
 			spin_unlock_irqrestore(&mctp->rx_spinlock, flags);
 
+			//printk("%s: b4 mctp_rx_submit", __func__);
 			rc = mctp_rx_submit(mctp, ep, next_req);
+			//printk("%s: aft mctp_rx_submit", __func__);
 			if (rc < 0) {
 				ERROR(cdev, "resubmit failed\n");
 				break;
 			}
 		} else {
+			printk("%s: list is empty", __func__);
 			spin_unlock_irqrestore(&mctp->rx_spinlock, flags);
 		}
 		return;
 	case -ESHUTDOWN:
+		printk("%s: ESHUTDOWN", __func__);
 		kfree_skb(req->context);
 		break;
 	case -ECONNABORTED:
 	case -ECONNRESET:
 	default:
+		printk("%s: invalid status", __func__);
 		WARNING(cdev, "%s: invalid status %d?", __func__, req->status);
 	}
 
-	free_ep_req(ep, req);
+	usb_ep_free_request(ep, req);
 }
 
 static int mctp_usbg_enable_ep(struct usb_gadget *gadget, struct f_mctp *mctp,
