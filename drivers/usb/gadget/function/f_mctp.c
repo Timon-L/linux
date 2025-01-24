@@ -232,7 +232,11 @@ static void mctp_usbg_out_ep_complete(struct usb_ep *ep,
 			//printk("%s: aft mctp_rx_submit", __func__);
 			if (rc < 0) {
 				ERROR(cdev, "resubmit failed\n");
-				break;
+				spin_lock_irqsave(&mctp->rx_spinlock, flags);
+				list_add_tail(&next_req->list,
+					      &mctp->free_rx_reqs);
+				spin_unlock_irqrestore(&mctp->rx_spinlock,
+						       flags);
 			}
 		} else {
 			printk("%s: list is empty", __func__);
@@ -243,14 +247,16 @@ static void mctp_usbg_out_ep_complete(struct usb_ep *ep,
 		printk("%s: ESHUTDOWN", __func__);
 		kfree_skb(req->context);
 		break;
-	case -ECONNABORTED:
 	case -ECONNRESET:
+	case -ECONNABORTED:
 	default:
 		printk("%s: invalid status", __func__);
 		WARNING(cdev, "%s: invalid status %d?", __func__, req->status);
 	}
 
-	usb_ep_free_request(ep, req);
+	spin_lock_irqsave(&mctp->rx_spinlock, flags);
+	list_add_tail(&req->list, &mctp->free_rx_reqs);
+	spin_unlock_irqrestore(&mctp->rx_spinlock, flags);
 }
 
 static int mctp_usbg_enable_ep(struct usb_gadget *gadget, struct f_mctp *mctp,
