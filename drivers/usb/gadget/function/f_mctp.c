@@ -11,7 +11,9 @@
 
 #include <linux/usb/func_utils.h>
 
-#define MAX_REQS_LEN 10
+#include <linux/usb/ch9.h>
+
+#define MAX_REQS_LEN 16
 
 struct f_mctp {
 	struct usb_function function;
@@ -125,21 +127,19 @@ static int mctp_usbg_bind(struct usb_configuration *c, struct usb_function *f)
 static int mctp_rx_submit(struct f_mctp *mctp, struct usb_ep *ep,
 			  struct usb_request *req)
 {
-	struct sk_buff *skb = req->context;
+	struct sk_buff *skb;
 	int rc = 0;
 
+	req->buf = NULL;
+
+	skb = netdev_alloc_skb(mctp->dev, MCTP_USB_XFER_SIZE);
 	if (!skb) {
-		req->buf = NULL;
-
-		skb = netdev_alloc_skb(mctp->dev, MCTP_USB_XFER_SIZE);
-		if (!skb) {
-			pr_warn("%s can't allocate skb", __func__);
-			return -1;
-		}
-
-		req->buf = skb->data;
-		req->context = skb;
+		pr_warn("%s can't allocate skb", __func__);
+		return -1;
 	}
+
+	req->buf = skb->data;
+	req->context = skb;
 
 	rc = usb_ep_queue(ep, req, GFP_ATOMIC);
 	if (rc)
@@ -200,6 +200,54 @@ err:
 	req->context = NULL;
 }
 
+//	USB_STATE_NOTATTACHED = 0,
+/* chapter 9 and authentication (wireless) device states */
+//	USB_STATE_ATTACHED,
+//	USB_STATE_POWERED,			/* wired */
+//	USB_STATE_RECONNECTING,			/* auth */
+//	USB_STATE_UNAUTHENTICATED,		/* auth */
+// /	USB_STATE_DEFAULT,			/* limited function */
+//	USB_STATE_ADDRESS,
+//	USB_STATE_CONFIGURED,			/* most functions */
+//	USB_STATE_SUSPENDED
+static void print_state(enum usb_device_state state)
+{
+	switch (state) {
+	case USB_STATE_NOTATTACHED:
+		printk("USB_STATE_NOTATTACHED");
+		break;
+	case USB_STATE_ATTACHED:
+		printk("USB_STATE_ATTACHED");
+		break;
+	case USB_STATE_POWERED:
+		printk("USB_STATE_POWERED");
+		break;
+	case USB_STATE_RECONNECTING:
+		printk("USB_STATE_RECONNECTING");
+		break;
+	case USB_STATE_UNAUTHENTICATED:
+		printk("USB_STATE_UNAUTHENTICATED");
+		break;
+	case USB_STATE_DEFAULT:
+		printk("USB_STATE_UNAUTHENTICATED");
+		break;
+	case USB_STATE_ADDRESS:
+		printk("USB_STATE_ADDRESS");
+		break;
+	case USB_STATE_CONFIGURED:
+		printk("USB_STATE_CONFIGURED");
+		break;
+	case USB_STATE_SUSPENDED:
+		printk("USB_STATE_SUSPENDED");
+		break;
+	default:
+		printk("unrecognized state");
+		break;
+	};
+
+	return;
+}
+
 static void mctp_usbg_out_ep_complete(struct usb_ep *ep,
 				      struct usb_request *req)
 {
@@ -208,11 +256,14 @@ static void mctp_usbg_out_ep_complete(struct usb_ep *ep,
 	unsigned long flags;
 	int rc;
 
+	/* enum usb_device_state state = cdev->gadget->state;
+	print_state(state); */
+
 	switch (req->status) {
 	case 0:
 		mctp_usbg_handle_rx_urb(mctp, req);
 
-		//dprintk("%s: before list_add_tail", __func__);
+		//printk("%s: before list_add_tail", __func__);
 		spin_lock_irqsave(&mctp->rx_spinlock, flags);
 		list_add_tail(&req->list, &mctp->free_rx_reqs);
 		spin_unlock_irqrestore(&mctp->rx_spinlock, flags);
@@ -246,6 +297,7 @@ static void mctp_usbg_out_ep_complete(struct usb_ep *ep,
 	case -ESHUTDOWN:
 		printk("%s: ESHUTDOWN", __func__);
 		kfree_skb(req->context);
+		req->context = NULL;
 		break;
 	case -ECONNRESET:
 	case -ECONNABORTED:

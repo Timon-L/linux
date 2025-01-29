@@ -406,8 +406,8 @@ static int ast_vhub_ep0_queue(struct usb_ep* u_ep, struct usb_request *u_req,
 	if (!list_empty(&ep->queue) ||
 	    ep->ep0.state == ep0_state_token ||
 	    ep->ep0.state == ep0_state_stall) {
-		dev_warn(dev, "EP0: Request in wrong state\n");
-	        EPVDBG(ep, "EP0: list_empty=%d state=%d\n",
+		dev_warn(dev, "Request in wrong state\n");
+	        EPVDBG(ep, "list_empty=%d state=%d\n",
 		       list_empty(&ep->queue), ep->ep0.state);
 		spin_unlock_irqrestore(&vhub->lock, flags);
 		return -EBUSY;

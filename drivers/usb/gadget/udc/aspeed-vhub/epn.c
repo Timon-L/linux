@@ -53,7 +53,7 @@ static void ast_vhub_epn_kick(struct ast_vhub_ep *ep, struct ast_vhub_req *req)
 	else if ((chunk < ep->ep.maxpacket) || !req->req.zero)
 		req->last_desc = 1;
 
-	EPVDBG(ep, "kick req %p act=%d/%d chunk=%d last=%d\n",
+	EPVDBG(ep, "epn: kick req %p act=%d/%d chunk=%d last=%d\n",
 	       req, act, len, chunk, req->last_desc);
 
 	/* If DMA unavailable, using staging EP buffer */
@@ -92,7 +92,7 @@ static void ast_vhub_epn_handle_ack(struct ast_vhub_ep *ep)
 	/* Grab current request if any */
 	req = list_first_entry_or_null(&ep->queue, struct ast_vhub_req, queue);
 
-	EPVDBG(ep, "ACK status=%08x is_in=%d, req=%p (active=%d)\n",
+	EPVDBG(ep, "epn: ACK status=%08x is_in=%d, req=%p (active=%d)\n",
 	       stat, ep->epn.is_in, req, req ? req->active : 0);
 
 	/* In absence of a request, bail out, must have been dequeued */
@@ -108,7 +108,7 @@ static void ast_vhub_epn_handle_ack(struct ast_vhub_ep *ep)
 
 	/* Check if HW has moved on */
 	if (VHUB_EP_DMA_RPTR(stat) != 0) {
-		EPDBG(ep, "DMA read pointer not 0 !\n");
+		EPDBG(ep, "error: DMA read pointer not 0 !\n");
 		return;
 	}
 
@@ -180,7 +180,7 @@ static void ast_vhub_epn_kick_desc(struct ast_vhub_ep *ep,
 	if (req->last_desc >= 0)
 		return;
 
-	EPVDBG(ep, "kick act=%d/%d chunk_max=%d free_descs=%d\n",
+	EPVDBG(ep, "epn: kick act=%d/%d chunk_max=%d free_descs=%d\n",
 	       act, len, ep->epn.chunk_max, ast_vhub_count_free_descs(ep));
 
 	/* While we can create descriptors */
@@ -209,7 +209,7 @@ static void ast_vhub_epn_kick_desc(struct ast_vhub_ep *ep,
 			chunk = ep->epn.chunk_max;
 		}
 
-		EPVDBG(ep, " chunk: act=%d/%d chunk=%d last=%d desc=%d free=%d\n",
+		EPVDBG(ep, "epn: chunk: act=%d/%d chunk=%d last=%d desc=%d free=%d\n",
 		       act, len, chunk, req->last_desc, d_num,
 		       ast_vhub_count_free_descs(ep));
 
@@ -241,7 +241,7 @@ static void ast_vhub_epn_kick_desc(struct ast_vhub_ep *ep,
 	writel(VHUB_EP_DMA_SET_CPU_WPTR(ep->epn.d_next),
 	       ep->epn.regs + AST_VHUB_EP_DESC_STATUS);
 
-	EPVDBG(ep, "HW kicked, d_next=%d dstat=%08x\n",
+	EPVDBG(ep, "epn: HW kicked, d_next=%d dstat=%08x\n",
 	       ep->epn.d_next, readl(ep->epn.regs + AST_VHUB_EP_DESC_STATUS));
 }
 
@@ -263,7 +263,7 @@ static void ast_vhub_epn_handle_ack_desc(struct ast_vhub_ep *ep)
 	/* Grab current request if any */
 	req = list_first_entry_or_null(&ep->queue, struct ast_vhub_req, queue);
 
-	EPVDBG(ep, "ACK status=%08x is_in=%d ep->d_last=%d..%d\n",
+	EPVDBG(ep, "epn: ACK status=%08x is_in=%d ep->d_last=%d..%d\n",
 	       stat, ep->epn.is_in, ep->epn.d_last, d_last);
 
 	/* Check all completed descriptors */
@@ -280,7 +280,7 @@ static void ast_vhub_epn_handle_ack_desc(struct ast_vhub_ep *ep)
 		/* Grab len out of descriptor */
 		len = VHUB_DSC1_IN_LEN(le32_to_cpu(desc->w1));
 
-		EPVDBG(ep, " desc %d len=%d req=%p (act=%d)\n",
+		EPVDBG(ep, "epn: desc %d len=%d req=%p (act=%d)\n",
 		       d_num, len, req, req ? req->active : 0);
 
 		/* If no active request pending, move on */
@@ -355,7 +355,7 @@ static int ast_vhub_epn_queue(struct usb_ep* u_ep, struct usb_request *u_req,
 	/* Endpoint enabled ? */
 	if (!ep->epn.enabled || !u_ep->desc || !ep->dev || !ep->d_idx ||
 	    !ep->dev->enabled) {
-		EPDBG(ep, "Enqueuing request on wrong or disabled EP\n");
+		EPDBG(ep, "error: Enqueuing request on wrong or disabled EP\n");
 		return -ESHUTDOWN;
 	}
 
@@ -388,8 +388,8 @@ static int ast_vhub_epn_queue(struct usb_ep* u_ep, struct usb_request *u_req,
 	} else
 		u_req->dma = 0;
 
-	EPVDBG(ep, "enqueue req @%p\n", req);
-	EPVDBG(ep, " l=%d dma=0x%x zero=%d noshort=%d noirq=%d is_in=%d\n",
+	EPVDBG(ep, "epn: enqueue req @%p\n", req);
+	EPVDBG(ep, "epn: l=%d dma=0x%x zero=%d noshort=%d noirq=%d is_in=%d\n",
 	       u_req->length, (u32)u_req->dma, u_req->zero,
 	       u_req->short_not_ok, u_req->no_interrupt,
 	       ep->epn.is_in);
@@ -488,7 +488,7 @@ static int ast_vhub_epn_dequeue(struct usb_ep* u_ep, struct usb_request *u_req)
 	}
 
 	if (req) {
-		EPVDBG(ep, "dequeue req @%p active=%d\n",
+		EPVDBG(ep, "epn: dequeue req @%p active=%d\n",
 		       req, req->active);
 		if (req->active)
 			ast_vhub_stop_active_req(ep, true);
@@ -525,7 +525,7 @@ static int ast_vhub_set_halt_and_wedge(struct usb_ep* u_ep, bool halt,
 	struct ast_vhub *vhub = ep->vhub;
 	unsigned long flags;
 
-	EPDBG(ep, "Set halt (%d) & wedge (%d)\n", halt, wedge);
+	EPDBG(ep, "error: Set halt (%d) & wedge (%d)\n", halt, wedge);
 
 	if (!u_ep || !u_ep->desc)
 		return -EINVAL;
@@ -567,7 +567,7 @@ static int ast_vhub_epn_disable(struct usb_ep* u_ep)
 	unsigned long flags;
 	u32 imask, ep_ier;
 
-	EPDBG(ep, "Disabling !\n");
+	EPDBG(ep, "error: Disabling !\n");
 
 	spin_lock_irqsave(&vhub->lock, flags);
 
@@ -615,18 +615,18 @@ static int ast_vhub_epn_enable(struct usb_ep* u_ep,
 	if (!ep->d_idx || !ep->dev ||
 	    desc->bDescriptorType != USB_DT_ENDPOINT ||
 	    maxpacket == 0 || maxpacket > ep->ep.maxpacket) {
-		EPDBG(ep, "Invalid EP enable,d_idx=%d,dev=%p,type=%d,mp=%d/%d\n",
+		EPDBG(ep, "error: Invalid EP enable,d_idx=%d,dev=%p,type=%d,mp=%d/%d\n",
 		      ep->d_idx, ep->dev, desc->bDescriptorType,
 		      maxpacket, ep->ep.maxpacket);
 		return -EINVAL;
 	}
 	if (ep->d_idx != usb_endpoint_num(desc)) {
-		EPDBG(ep, "EP number mismatch !\n");
+		EPDBG(ep, "error: EP number mismatch !\n");
 		return -EINVAL;
 	}
 
 	if (ep->epn.enabled) {
-		EPDBG(ep, "Already enabled\n");
+		EPDBG(ep, "error: Already enabled\n");
 		return -EBUSY;
 	}
 	dev = ep->dev;
@@ -634,7 +634,7 @@ static int ast_vhub_epn_enable(struct usb_ep* u_ep,
 
 	/* Check device state */
 	if (!dev->driver) {
-		EPDBG(ep, "Bogus device state: driver=%p speed=%d\n",
+		EPDBG(ep, "error: Bogus device state: driver=%p speed=%d\n",
 		       dev->driver, dev->gadget.speed);
 		return -ESHUTDOWN;
 	}
@@ -648,7 +648,7 @@ static int ast_vhub_epn_enable(struct usb_ep* u_ep,
 	ep->epn.stalled = false;
 	ep->epn.wedged = false;
 
-	EPDBG(ep, "Enabling [%s] %s num %d maxpacket=%d\n",
+	EPDBG(ep, "error: Enabling [%s] %s num %d maxpacket=%d\n",
 	      ep->epn.is_in ? "in" : "out", usb_ep_type_string(type),
 	      usb_endpoint_num(desc), maxpacket);
 
@@ -670,7 +670,7 @@ static int ast_vhub_epn_enable(struct usb_ep* u_ep,
 
 	switch(type) {
 	case USB_ENDPOINT_XFER_CONTROL:
-		EPDBG(ep, "Only one control endpoint\n");
+		EPDBG(ep, "error: Only one control endpoint\n");
 		return -EINVAL;
 	case USB_ENDPOINT_XFER_INT:
 		ep_conf = VHUB_EP_CFG_SET_TYPE(EP_TYPE_INT);
@@ -694,7 +694,7 @@ static int ast_vhub_epn_enable(struct usb_ep* u_ep,
 	ep_conf |= VHUB_EP_CFG_SET_EP_NUM(usb_endpoint_num(desc));
 	ep_conf |= VHUB_EP_CFG_ENABLE;
 	ep_conf |= VHUB_EP_CFG_SET_DEV(dev->index + 1);
-	EPVDBG(ep, "config=%08x\n", ep_conf);
+	EPVDBG(ep, "epn: config=%08x\n", ep_conf);
 
 	spin_lock_irqsave(&vhub->lock, flags);
 
