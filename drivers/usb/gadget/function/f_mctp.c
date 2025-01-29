@@ -125,22 +125,19 @@ static int mctp_usbg_bind(struct usb_configuration *c, struct usb_function *f)
 static int mctp_rx_submit(struct f_mctp *mctp, struct usb_ep *ep,
 			  struct usb_request *req)
 {
-	struct sk_buff *skb = req->context;
+	struct sk_buff *skb;
 	int rc = 0;
 
+	req->buf = NULL;
+
+	skb = netdev_alloc_skb(mctp->dev, MCTP_USB_XFER_SIZE);
 	if (!skb) {
-		req->buf = NULL;
-
-		skb = netdev_alloc_skb(mctp->dev, MCTP_USB_XFER_SIZE);
-		if (!skb) {
-			pr_warn("%s can't allocate skb", __func__);
-			return -1;
-		}
-
-		req->buf = skb->data;
-		req->context = skb;
+		pr_warn("%s can't allocate skb", __func__);
+		return -1;
 	}
 
+	req->buf = skb->data;
+	req->context = skb;
 	rc = usb_ep_queue(ep, req, GFP_ATOMIC);
 	if (rc)
 		pr_warn("usb_ep_queue err");
@@ -197,7 +194,6 @@ static void mctp_usbg_handle_rx_urb(struct f_mctp *mctp,
 err:
 	printk("%s: err", __func__);
 	kfree_skb(skb);
-	req->context = NULL;
 }
 
 static void mctp_usbg_out_ep_complete(struct usb_ep *ep,
@@ -212,31 +208,22 @@ static void mctp_usbg_out_ep_complete(struct usb_ep *ep,
 	case 0:
 		mctp_usbg_handle_rx_urb(mctp, req);
 
-		//dprintk("%s: before list_add_tail", __func__);
 		spin_lock_irqsave(&mctp->rx_spinlock, flags);
 		list_add_tail(&req->list, &mctp->free_rx_reqs);
 		spin_unlock_irqrestore(&mctp->rx_spinlock, flags);
 
-		//printk("%s: before list_empty", __func__);
 		spin_lock_irqsave(&mctp->rx_spinlock, flags);
 		if (!list_empty(&mctp->free_rx_reqs)) {
 			struct usb_request *next_req = list_first_entry(
 				&mctp->free_rx_reqs, struct usb_request, list);
 
-			//printk("%s: before list_del", __func__);
 			list_del(&next_req->list);
 			spin_unlock_irqrestore(&mctp->rx_spinlock, flags);
 
-			//printk("%s: b4 mctp_rx_submit", __func__);
 			rc = mctp_rx_submit(mctp, ep, next_req);
-			//printk("%s: aft mctp_rx_submit", __func__);
 			if (rc < 0) {
 				ERROR(cdev, "resubmit failed\n");
-				spin_lock_irqsave(&mctp->rx_spinlock, flags);
-				list_add_tail(&next_req->list,
-					      &mctp->free_rx_reqs);
-				spin_unlock_irqrestore(&mctp->rx_spinlock,
-						       flags);
+				break;
 			}
 		} else {
 			printk("%s: list is empty", __func__);

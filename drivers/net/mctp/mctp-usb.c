@@ -7,7 +7,7 @@
 
 #include <uapi/linux/if_arp.h>
 
-#define MAX_TX_URB_LEN 10
+#define MAX_TX_URB_LEN 8
 struct mctp_usb {
 	struct usb_device *usbdev;
 	struct usb_interface *intf;
@@ -75,12 +75,10 @@ static void mctp_usb_out_complete(struct urb *urb)
 	}
 
 	spin_lock_irqsave(&mctp_usb->tx_spinlock, flags);
+	if (list_empty(&mctp_usb->free_tx_urbs))
+		netif_wake_queue(netdev);
 	list_add_tail(&urb->urb_list, &mctp_usb->free_tx_urbs);
 	spin_unlock_irqrestore(&mctp_usb->tx_spinlock, flags);
-
-	if (netif_queue_stopped(netdev)) {
-		netif_wake_queue(netdev);
-	}
 
 	kfree_skb(skb);
 }
@@ -128,7 +126,10 @@ static netdev_tx_t mctp_usb_start_xmit(struct sk_buff *skb,
 
 	rc = usb_submit_urb(tx_urb, GFP_ATOMIC);
 	if (rc) {
+		printk("failed to submit");
 		spin_lock_irqsave(&mctp_usb->tx_spinlock, flags);
+		if (list_empty(&mctp_usb->free_tx_urbs))
+			netif_wake_queue(dev);
 		list_add_tail(&tx_urb->urb_list, &mctp_usb->free_tx_urbs);
 		spin_unlock_irqrestore(&mctp_usb->tx_spinlock, flags);
 		goto err_drop;
@@ -213,7 +214,7 @@ static int mctp_usb_probe(struct usb_interface *intf,
 	INIT_LIST_HEAD(&dev->free_tx_urbs);
 
 	spin_lock_irqsave(&dev->tx_spinlock, flags);
-	for (int i = 0; i < MAX_URB_LIST_LEN; i++) {
+	for (int i = 0; i < MAX_TX_URB_LEN; i++) {
 		struct urb *tx_urb = usb_alloc_urb(0, GFP_KERNEL);
 		if (!tx_urb) {
 			rc = -ENOMEM;
