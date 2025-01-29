@@ -109,15 +109,17 @@ static netdev_tx_t mctp_usb_start_xmit(struct sk_buff *skb,
 	hdr->len = plen + sizeof(*hdr);
 
 	spin_lock_irqsave(&mctp_usb->tx_spinlock, flags);
-	if (list_empty(&mctp_usb->free_tx_urbs)) {
+	tx_urb = list_first_entry_or_null(&mctp_usb->free_tx_urbs, struct urb,
+					  urb_list);
+	if (tx_urb) {
+		list_del(&tx_urb->urb_list);
+	} else {
 		spin_unlock_irqrestore(&mctp_usb->tx_spinlock, flags);
-		netif_stop_queue(dev);
-		return NETDEV_TX_BUSY;
+		return NETDEV_TX_OK;
 	}
 
-	tx_urb =
-		list_first_entry(&mctp_usb->free_tx_urbs, struct urb, urb_list);
-	list_del(&tx_urb->urb_list);
+	if (list_empty(&mctp_usb->free_tx_urbs))
+		netif_stop_queue(dev);
 	spin_unlock_irqrestore(&mctp_usb->tx_spinlock, flags);
 
 	usb_fill_bulk_urb(tx_urb, mctp_usb->usbdev,
@@ -130,8 +132,6 @@ static netdev_tx_t mctp_usb_start_xmit(struct sk_buff *skb,
 		list_add_tail(&tx_urb->urb_list, &mctp_usb->free_tx_urbs);
 		spin_unlock_irqrestore(&mctp_usb->tx_spinlock, flags);
 		goto err_drop;
-	} else {
-		netif_stop_queue(dev);
 	}
 
 	return NETDEV_TX_OK;
