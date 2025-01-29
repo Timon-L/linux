@@ -7,15 +7,14 @@
 
 #include <uapi/linux/if_arp.h>
 
-#define MAX_URB_LIST_LEN 10
+#define MAX_TX_URB_LEN 16
 struct mctp_usb {
 	struct usb_device *usbdev;
 	struct usb_interface *intf;
 
 	struct net_device *netdev;
-
-	spinlock_t tx_spinlock;
-	struct list_head free_tx_urbs;
+	struct usb_anchor tx_anchor;
+	atomic_t transmitted_tx;
 
 	__u8 ep_in;
 	__u8 ep_out;
@@ -45,7 +44,6 @@ static void mctp_usb_out_complete(struct urb *urb)
 	struct sk_buff *skb = urb->context;
 	struct net_device *netdev = skb->dev;
 	struct mctp_usb *mctp_usb = netdev_priv(netdev);
-	unsigned long flags;
 	int status;
 
 	status = urb->status;
@@ -53,7 +51,10 @@ static void mctp_usb_out_complete(struct urb *urb)
 	switch (status) {
 	case 0:
 		mctp_usb_stat_tx_done(netdev, skb->len);
-		break;
+		consume_skb(skb);
+		netif_wake_queue(netdev);
+		atomic_dec(&mctp_usb->transmitted_tx);
+		return;
 	case -ENOENT:
 		printk("%s ENOENT\n", __func__);
 		break;
@@ -74,14 +75,6 @@ static void mctp_usb_out_complete(struct urb *urb)
 		break;
 	}
 
-	spin_lock_irqsave(&mctp_usb->tx_spinlock, flags);
-	list_add_tail(&urb->urb_list, &mctp_usb->free_tx_urbs);
-	spin_unlock_irqrestore(&mctp_usb->tx_spinlock, flags);
-
-	if (netif_queue_stopped(netdev)) {
-		netif_wake_queue(netdev);
-	}
-
 	kfree_skb(skb);
 }
 
@@ -92,51 +85,55 @@ static netdev_tx_t mctp_usb_start_xmit(struct sk_buff *skb,
 	struct mctp_usb_hdr *hdr;
 	unsigned int plen;
 	struct urb *tx_urb;
-	unsigned long flags;
 	int rc;
 
 	plen = skb->len;
 
 	if (plen + sizeof(*hdr) > MCTP_USB_XFER_SIZE)
-		goto err_drop;
+		goto err_drop_no_urb;
 
 	hdr = skb_push(skb, sizeof(*hdr));
 	if (!hdr)
-		goto err_drop;
+		goto err_drop_no_urb;
 
 	hdr->id = cpu_to_be16(MCTP_USB_DMTF_ID);
 	hdr->rsvd = 0;
 	hdr->len = plen + sizeof(*hdr);
 
-	spin_lock_irqsave(&mctp_usb->tx_spinlock, flags);
-	tx_urb = list_first_entry_or_null(&mctp_usb->free_tx_urbs, struct urb,
-					  urb_list);
-	if (tx_urb) {
-		list_del(&tx_urb->urb_list);
-	} else {
-		spin_unlock_irqrestore(&mctp_usb->tx_spinlock, flags);
-		return NETDEV_TX_OK;
+	tx_urb = usb_alloc_urb(0, GFP_ATOMIC);
+	if (!tx_urb) {
+		pr_warn("%s: alloc urb err", __func__);
+		goto err_drop_no_urb;
 	}
-
-	if (list_empty(&mctp_usb->free_tx_urbs))
-		netif_stop_queue(dev);
-	spin_unlock_irqrestore(&mctp_usb->tx_spinlock, flags);
 
 	usb_fill_bulk_urb(tx_urb, mctp_usb->usbdev,
 			  usb_sndbulkpipe(mctp_usb->usbdev, mctp_usb->ep_out),
 			  skb->data, skb->len, mctp_usb_out_complete, skb);
+	//usb_anchor_urb(tx_urb, &mctp_usb->tx_anchor);
+	atomic_inc(&mctp_usb->transmitted_tx);
 
 	rc = usb_submit_urb(tx_urb, GFP_ATOMIC);
 	if (rc) {
-		spin_lock_irqsave(&mctp_usb->tx_spinlock, flags);
-		list_add_tail(&tx_urb->urb_list, &mctp_usb->free_tx_urbs);
-		spin_unlock_irqrestore(&mctp_usb->tx_spinlock, flags);
 		goto err_drop;
+		/* usb_unanchor_urb(tx_urb);
+		if (rc == -ENODEV) {
+			netif_device_detach(dev);
+		} else {
+			pr_warn("failed to tx");
+			mctp_usb_stat_tx_dropped(dev);
+		} */
 	}
 
+	if (atomic_read(&mctp_usb->transmitted_tx) >= MAX_TX_URB_LEN)
+		netif_stop_queue(dev);
+
+	usb_free_urb(tx_urb);
 	return NETDEV_TX_OK;
 
 err_drop:
+	atomic_dec(&mctp_usb->transmitted_tx);
+	usb_free_urb(tx_urb);
+err_drop_no_urb:
 	mctp_usb_stat_tx_dropped(dev);
 	kfree_skb(skb);
 	return NETDEV_TX_OK;
@@ -183,7 +180,6 @@ static int mctp_usb_probe(struct usb_interface *intf,
 	struct usb_host_interface *iface_desc;
 	struct net_device *netdev;
 	struct mctp_usb *dev;
-	unsigned long flags;
 	int rc;
 
 	iface_desc = intf->cur_altsetting;
@@ -208,21 +204,7 @@ static int mctp_usb_probe(struct usb_interface *intf,
 	dev->ep_in = ep_in->bEndpointAddress;
 	dev->ep_out = ep_out->bEndpointAddress;
 
-	spin_lock_init(&dev->tx_spinlock);
-	INIT_LIST_HEAD(&dev->free_tx_urbs);
-
-	spin_lock_irqsave(&dev->tx_spinlock, flags);
-	for (int i = 0; i < MAX_URB_LIST_LEN; i++) {
-		struct urb *tx_urb = usb_alloc_urb(0, GFP_KERNEL);
-		if (!tx_urb) {
-			rc = -ENOMEM;
-			spin_unlock_irqrestore(&dev->tx_spinlock, flags);
-			goto err_free_urbs;
-		}
-
-		list_add(&tx_urb->urb_list, &dev->free_tx_urbs);
-	}
-	spin_unlock_irqrestore(&dev->tx_spinlock, flags);
+	//init_usb_anchor(&dev->tx_anchor);
 
 	rc = register_netdev(netdev);
 	if (rc)
@@ -231,15 +213,6 @@ static int mctp_usb_probe(struct usb_interface *intf,
 	return 0;
 
 err_free_urbs:
-	spin_lock_irqsave(&dev->tx_spinlock, flags);
-	while (!list_empty(&dev->free_tx_urbs)) {
-		struct urb *tx_urb = list_first_entry(&dev->free_tx_urbs,
-						      struct urb, urb_list);
-		list_del(&tx_urb->urb_list);
-
-		usb_free_urb(tx_urb);
-	}
-	spin_unlock_irqrestore(&dev->tx_spinlock, flags);
 	free_netdev(netdev);
 	return rc;
 }
