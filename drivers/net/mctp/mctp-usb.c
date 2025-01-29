@@ -7,7 +7,7 @@
 
 #include <uapi/linux/if_arp.h>
 
-#define MAX_URB_LIST_LEN 10
+#define MAX_TX_URB_LEN 10
 struct mctp_usb {
 	struct usb_device *usbdev;
 	struct usb_interface *intf;
@@ -137,6 +137,7 @@ static netdev_tx_t mctp_usb_start_xmit(struct sk_buff *skb,
 	return NETDEV_TX_OK;
 
 err_drop:
+	printk("Msg dropped");
 	mctp_usb_stat_tx_dropped(dev);
 	kfree_skb(skb);
 	return NETDEV_TX_OK;
