@@ -1,29 +1,53 @@
+
+// SPDX-License-Identifier: GPL-2.0+
+/*
+ * f_mctp.c - USB peripheral MCTP driver
+ *
+ * Copyright (C) 2024 Code Construct Pty Ltd
+ */
+
+#include <linux/slab.h>
 #include <linux/kernel.h>
+#include <linux/device.h>
+#include <linux/module.h>
 #include <linux/usb/composite.h>
+#include <linux/skbuff.h>
+#include <linux/err.h>
 #include <linux/netdevice.h>
+#include <linux/list.h>
 
 #include <net/mctp.h>
-#include "net/pkt_sched.h"
+#include <net/pkt_sched.h>
 
-#include "linux/usb/mctp-usb.h"
+#include <linux/usb/mctp-usb.h>
 
 #include <uapi/linux/if_arp.h>
 
 #include <linux/usb/func_utils.h>
 
-#include <linux/usb/ch9.h>
-
-#define MAX_REQS_LEN 16
+#define MCTP_USB_PREALLOC 4
 
 struct f_mctp {
 	struct usb_function function;
+
 	struct usb_ep *in_ep;
 	struct usb_ep *out_ep;
 
 	struct net_device *dev;
 
-	spinlock_t rx_spinlock;
-	struct list_head free_rx_reqs;
+	/* Updates to skb_free_list and the req lists are performed under
+	 * ->lock
+	 */
+	spinlock_t lock;
+	struct sk_buff_head skb_free_list;
+	struct list_head rx_reqs;
+	struct list_head tx_reqs;
+
+	struct work_struct prealloc_work;
+
+	unsigned int tx_batch_delay;
+	struct sk_buff_head tx_batch;
+	struct delayed_work tx_batch_work;
 };
 
 struct f_mctp_opts {
@@ -44,7 +68,10 @@ static struct usb_interface_descriptor mctp_usbg_intf = {
 	.bInterfaceClass = USB_CLASS_MCTP,
 	.bInterfaceSubClass = 0x0, /* todo: allow host-interface mode? */
 	.bInterfaceProtocol = 0x1, /* MCTP version 1 */
+	/* .iInterface = DYNAMIC */
 };
+
+/* descriptors, full speed only */
 
 static struct usb_endpoint_descriptor hs_mctp_source_desc = {
 	.bLength = USB_DT_ENDPOINT_SIZE,
@@ -65,14 +92,15 @@ static struct usb_endpoint_descriptor hs_mctp_sink_desc = {
 };
 
 static struct usb_descriptor_header *hs_mctp_descs[] = {
-	[0] = (struct usb_descriptor_header *)&mctp_usbg_intf,
-	[1] = (struct usb_descriptor_header *)&hs_mctp_sink_desc,
-	[2] = (struct usb_descriptor_header *)&hs_mctp_source_desc,
-	[3] = NULL,
+	(struct usb_descriptor_header *)&mctp_usbg_intf,
+	(struct usb_descriptor_header *)&hs_mctp_sink_desc,
+	(struct usb_descriptor_header *)&hs_mctp_source_desc,
+	NULL,
 };
 
-static struct usb_string
-	mctp_usbg_strings[] = { [0] = { .s = "MCTP over USB" }, [1] = { 0 } };
+/* strings */
+static struct usb_string mctp_usbg_strings[] = { { .s = "MCTP over USB" },
+						 { 0 } };
 
 static struct usb_gadget_strings mctp_usbg_stringtab = {
 	.language = 0x0409, /* en-us */
@@ -80,8 +108,8 @@ static struct usb_gadget_strings mctp_usbg_stringtab = {
 };
 
 static struct usb_gadget_strings *mctp_usbg_gadget_strings[] = {
-	[0] = &mctp_usbg_stringtab,
-	[1] = NULL,
+	&mctp_usbg_stringtab,
+	NULL,
 };
 
 static int mctp_usbg_bind(struct usb_configuration *c, struct usb_function *f)
@@ -115,17 +143,156 @@ static int mctp_usbg_bind(struct usb_configuration *c, struct usb_function *f)
 
 	rc = usb_assign_descriptors(f, NULL, hs_mctp_descs, NULL, NULL);
 	if (rc) {
-		ERROR(cdev, "assign_descriptos failed %d\n", rc);
+		ERROR(cdev, "assign_descriptors failed %d\n", rc);
 		return rc;
 	}
 
 	DBG(cdev, "%s: in %s, out %s\n", f->name, mctp->in_ep->name,
 	    mctp->out_ep->name);
+
 	return 0;
 }
 
-static int mctp_rx_submit(struct f_mctp *mctp, struct usb_ep *ep,
-			  struct usb_request *req)
+static unsigned int __mctp_usbg_tx_batch_len(struct f_mctp *mctp)
+	__must_hold(&mctp->lock)
+{
+	struct sk_buff_head *batch = &mctp->tx_batch;
+	unsigned int len = 0;
+	struct sk_buff *skb;
+
+	for (skb = __skb_peek(batch); skb; skb = skb_peek_next(skb, batch))
+		len += skb->len;
+
+	return len;
+}
+
+/* skb already has USB headers, may contain multiple packets */
+static int __mctp_usbg_tx(struct f_mctp *mctp, struct sk_buff *skb)
+	__must_hold(&mctp->lock)
+{
+	struct net_device *dev = mctp->dev;
+	struct usb_request *req;
+
+	if (!mctp || !skb || !mctp->dev || !mctp->in_ep) {
+		pr_err("mctp_usbg: NULL pointer detected! mctp=%p, skb=%p, dev=%p, in_ep=%p\n",
+		       mctp, skb, mctp ? mctp->dev : NULL,
+		       mctp ? mctp->in_ep : NULL);
+		return -EINVAL;
+	}
+
+	req = list_first_entry_or_null(&mctp->tx_reqs, struct usb_request,
+				       /*  */ list);
+	if (req) {
+		list_del(&req->list);
+	}
+	if (list_empty(&mctp->tx_reqs))
+		netif_stop_queue(dev);
+
+	if (!req) {
+		printk("netdev_err path");
+		netdev_err(dev, "no tx reqs available!\n");
+		return -1;
+	}
+
+	req->context = skb;
+	req->buf = skb->data;
+	req->length = skb->len;
+
+	printk("enqueue");
+	int ret = usb_ep_queue(mctp->in_ep, req, GFP_ATOMIC);
+	if (ret)
+		printk("queue returned error: %d", ret);
+	return 0;
+}
+
+static void __mctp_usbg_batch_tx(struct f_mctp *mctp) __must_hold(&mctp->lock)
+{
+	unsigned int i = 1, batch_len = 0;
+	struct sk_buff *skb, *skb2;
+	bool realloc = false;
+
+	batch_len = __mctp_usbg_tx_batch_len(mctp);
+
+	skb = __skb_dequeue(&mctp->tx_batch);
+	if (!skb)
+		return;
+
+	/* if the first skb can't hold the batch, allocate a new one */
+	if (batch_len - skb->len > skb_tailroom(skb)) {
+		realloc = true;
+		skb2 = skb;
+		skb = netdev_alloc_skb(mctp->dev, batch_len);
+		if (!skb) {
+			netdev_warn_once(mctp->dev, "batch alloc failed\n");
+			__skb_queue_purge(&mctp->tx_batch);
+			return;
+		}
+		__skb_put_data(skb, skb2->data, skb2->len);
+		consume_skb(skb2);
+	}
+
+	while ((skb2 = __skb_dequeue(&mctp->tx_batch)) != NULL) {
+		__skb_put_data(skb, skb2->data, skb2->len);
+		consume_skb(skb2);
+		i++;
+	}
+
+	netdev_dbg(mctp->dev, "batch tx: %d for len %d%s. skb len %d\n", i,
+		   batch_len, realloc ? ", realloced" : "", skb->len);
+
+	__mctp_usbg_tx(mctp, skb);
+}
+
+static void mctp_usbg_batch_tx(struct f_mctp *mctp)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&mctp->lock, flags);
+	__mctp_usbg_batch_tx(mctp);
+	spin_unlock_irqrestore(&mctp->lock, flags);
+}
+
+static void mctp_usbg_batch_tx_work(struct work_struct *work)
+{
+	struct f_mctp *mctp =
+		container_of(work, struct f_mctp, tx_batch_work.work);
+
+	mctp_usbg_batch_tx(mctp);
+}
+
+//static int mctp_usbg_requeue(struct f_mctp *mctp, struct usb_ep *ep,
+//			     struct usb_request *req)
+//{
+//	unsigned long flags;
+//	struct sk_buff *skb;
+//	int rc = 0;
+//
+//	req->buf = NULL;
+//
+//	spin_lock_irqsave(&mctp->lock, flags);
+//
+//	/* Do we have a preallocated skb available? if so, we can requeue
+//	 * immediately; otherwise wait for the workqueue to populate.
+//	 */
+//	skb = __skb_dequeue(&mctp->skb_free_list);
+//	if (skb) {
+//		req->buf = skb->data;
+//		req->context = skb;
+//		rc = usb_ep_queue(ep, req, GFP_ATOMIC);
+//	} else {
+//		/* keep for later allocation */
+//		list_add_tail(&req->list, &mctp->rx_reqs);
+//	}
+//
+//	spin_unlock_irqrestore(&mctp->lock, flags);
+//
+//	schedule_work(&mctp->prealloc_work);
+//
+//	return rc;
+///*  */}
+
+static int mctp_usbg_requeue(struct f_mctp *mctp, struct usb_ep *ep,
+			     struct usb_request *req)
 {
 	struct sk_buff *skb;
 	int rc = 0;
@@ -140,7 +307,6 @@ static int mctp_rx_submit(struct f_mctp *mctp, struct usb_ep *ep,
 
 	req->buf = skb->data;
 	req->context = skb;
-
 	rc = usb_ep_queue(ep, req, GFP_ATOMIC);
 	if (rc)
 		pr_warn("usb_ep_queue err");
@@ -162,9 +328,9 @@ static void mctp_usbg_handle_rx_urb(struct f_mctp *mctp,
 	__skb_put(skb, len);
 
 	hdr = skb_pull_data(skb, sizeof(*hdr));
-
 	if (!hdr)
 		goto err;
+
 	id = be16_to_cpu(hdr->id);
 	if (id != MCTP_USB_DMTF_ID) {
 		dev_dbg(dev, "%s: invalid id %04x\n", __func__, id);
@@ -176,6 +342,7 @@ static void mctp_usbg_handle_rx_urb(struct f_mctp *mctp,
 		goto err;
 	}
 
+	/* todo: multi-packet transfers */
 	if (hdr->len - sizeof(struct mctp_usb_hdr) < skb->len) {
 		dev_dbg(dev, "%s: short packet (xfer) %d, actual %d\n",
 			__func__, hdr->len, skb->len);
@@ -194,58 +361,10 @@ static void mctp_usbg_handle_rx_urb(struct f_mctp *mctp,
 	u64_stats_update_end(&dstats->syncp);
 
 	return;
+
 err:
-	printk("%s: err", __func__);
+	/* todo: return to free list */
 	kfree_skb(skb);
-	req->context = NULL;
-}
-
-//	USB_STATE_NOTATTACHED = 0,
-/* chapter 9 and authentication (wireless) device states */
-//	USB_STATE_ATTACHED,
-//	USB_STATE_POWERED,			/* wired */
-//	USB_STATE_RECONNECTING,			/* auth */
-//	USB_STATE_UNAUTHENTICATED,		/* auth */
-// /	USB_STATE_DEFAULT,			/* limited function */
-//	USB_STATE_ADDRESS,
-//	USB_STATE_CONFIGURED,			/* most functions */
-//	USB_STATE_SUSPENDED
-static void print_state(enum usb_device_state state)
-{
-	switch (state) {
-	case USB_STATE_NOTATTACHED:
-		printk("USB_STATE_NOTATTACHED");
-		break;
-	case USB_STATE_ATTACHED:
-		printk("USB_STATE_ATTACHED");
-		break;
-	case USB_STATE_POWERED:
-		printk("USB_STATE_POWERED");
-		break;
-	case USB_STATE_RECONNECTING:
-		printk("USB_STATE_RECONNECTING");
-		break;
-	case USB_STATE_UNAUTHENTICATED:
-		printk("USB_STATE_UNAUTHENTICATED");
-		break;
-	case USB_STATE_DEFAULT:
-		printk("USB_STATE_UNAUTHENTICATED");
-		break;
-	case USB_STATE_ADDRESS:
-		printk("USB_STATE_ADDRESS");
-		break;
-	case USB_STATE_CONFIGURED:
-		printk("USB_STATE_CONFIGURED");
-		break;
-	case USB_STATE_SUSPENDED:
-		printk("USB_STATE_SUSPENDED");
-		break;
-	default:
-		printk("unrecognized state");
-		break;
-	};
-
-	return;
 }
 
 static void mctp_usbg_out_ep_complete(struct usb_ep *ep,
@@ -253,62 +372,70 @@ static void mctp_usbg_out_ep_complete(struct usb_ep *ep,
 {
 	struct f_mctp *mctp = ep->driver_data;
 	struct usb_composite_dev *cdev = mctp->function.config->cdev;
-	unsigned long flags;
 	int rc;
 
-	/* enum usb_device_state state = cdev->gadget->state;
-	print_state(state); */
-
+	//printk("%s status:%d", __func__, req->status);
 	switch (req->status) {
 	case 0:
 		mctp_usbg_handle_rx_urb(mctp, req);
 
-		//printk("%s: before list_add_tail", __func__);
-		spin_lock_irqsave(&mctp->rx_spinlock, flags);
-		list_add_tail(&req->list, &mctp->free_rx_reqs);
-		spin_unlock_irqrestore(&mctp->rx_spinlock, flags);
-
-		//printk("%s: before list_empty", __func__);
-		spin_lock_irqsave(&mctp->rx_spinlock, flags);
-		if (!list_empty(&mctp->free_rx_reqs)) {
-			struct usb_request *next_req = list_first_entry(
-				&mctp->free_rx_reqs, struct usb_request, list);
-
-			//printk("%s: before list_del", __func__);
-			list_del(&next_req->list);
-			spin_unlock_irqrestore(&mctp->rx_spinlock, flags);
-
-			//printk("%s: b4 mctp_rx_submit", __func__);
-			rc = mctp_rx_submit(mctp, ep, next_req);
-			//printk("%s: aft mctp_rx_submit", __func__);
-			if (rc < 0) {
-				ERROR(cdev, "resubmit failed\n");
-				spin_lock_irqsave(&mctp->rx_spinlock, flags);
-				list_add_tail(&next_req->list,
-					      &mctp->free_rx_reqs);
-				spin_unlock_irqrestore(&mctp->rx_spinlock,
-						       flags);
-			}
-		} else {
-			printk("%s: list is empty", __func__);
-			spin_unlock_irqrestore(&mctp->rx_spinlock, flags);
+		/* re-queue out request */
+		rc = mctp_usbg_requeue(mctp, ep, req);
+		if (rc) {
+			WARNING(cdev, "%s: unable to re-queue out req\n",
+				__func__);
+			usb_ep_free_request(ep, req);
 		}
-		return;
-	case -ESHUTDOWN:
-		printk("%s: ESHUTDOWN", __func__);
-		kfree_skb(req->context);
-		req->context = NULL;
+		break;
+
+	case -ECONNABORTED:
+		printk("%s ECONNABORTED", __func__);
 		break;
 	case -ECONNRESET:
-	case -ECONNABORTED:
-	default:
-		printk("%s: invalid status", __func__);
-		WARNING(cdev, "%s: invalid status %d?", __func__, req->status);
-	}
+		printk("%s ECONNRESET", __func__);
+		break;
+	case -ESHUTDOWN:
+		printk("%s ESHUTDOWN", __func__);
+		kfree_skb(req->context);
+		usb_ep_free_request(ep, req);
+		break;
 
-	spin_lock_irqsave(&mctp->rx_spinlock, flags);
-	list_add_tail(&req->list, &mctp->free_rx_reqs);
-	spin_unlock_irqrestore(&mctp->rx_spinlock, flags);
+	default:
+		WARNING(cdev, "%s: invalid status %d?", __func__, req->status);
+		usb_ep_free_request(ep, req);
+	}
+}
+
+static void mctp_usbg_in_ep_complete(struct usb_ep *ep, struct usb_request *req)
+{
+	struct f_mctp *mctp = ep->driver_data;
+	struct usb_composite_dev *cdev = mctp->function.config->cdev;
+	struct sk_buff *skb = req->context;
+	unsigned long flags;
+
+	kfree_skb(skb);
+	req->context = NULL;
+	req->buf = NULL;
+
+	/* todo: tx stats */
+
+	switch (req->status) {
+	case 0:
+		spin_lock_irqsave(&mctp->lock, flags);
+		if (list_empty(&mctp->tx_reqs))
+			netif_start_queue(mctp->dev);
+		list_add(&req->list, &mctp->tx_reqs);
+		spin_unlock_irqrestore(&mctp->lock, flags);
+		break;
+	case -ECONNABORTED:
+	case -ECONNRESET:
+	case -ESHUTDOWN:
+		usb_ep_free_request(ep, req);
+		break;
+	default:
+		WARNING(cdev, "%s: invalid status %d?", __func__, req->status);
+		usb_ep_free_request(ep, req);
+	}
 }
 
 static int mctp_usbg_enable_ep(struct usb_gadget *gadget, struct f_mctp *mctp,
@@ -331,7 +458,9 @@ static int mctp_usbg_enable_ep(struct usb_gadget *gadget, struct f_mctp *mctp,
 
 static int mctp_usbg_enable(struct usb_composite_dev *cdev, struct f_mctp *mctp)
 {
-	struct usb_request *out_req;
+	struct usb_request *out_req, *in_req;
+	//unsigned long flags;
+	struct sk_buff *skb;
 	int rc;
 
 	rc = mctp_usbg_enable_ep(cdev->gadget, mctp, mctp->out_ep);
@@ -346,32 +475,116 @@ static int mctp_usbg_enable(struct usb_composite_dev *cdev, struct f_mctp *mctp)
 		goto err_disable_out;
 	}
 
-	for (int i = 0; i < MAX_REQS_LEN; i++) {
-		out_req = alloc_ep_req(mctp->out_ep, MCTP_USB_XFER_SIZE);
-		if (!out_req) {
-			ERROR(cdev, "%s: out req alloc failed\n", __func__);
-			goto err_disable_in;
-		}
-
-		out_req->complete = mctp_usbg_out_ep_complete;
-
-		rc = mctp_rx_submit(mctp, mctp->out_ep, out_req);
-		if (rc) {
-			ERROR(cdev, "%s: out req queue failed %d\b", __func__,
-			      rc);
-			free_ep_req(mctp->out_ep, out_req);
-			goto err_disable_in;
-		}
+	/* todo: just one out queued req for now */
+	out_req = alloc_ep_req(mctp->out_ep, MCTP_USB_XFER_SIZE);
+	if (!out_req) {
+		ERROR(cdev, "%s: out req alloc failed\n", __func__);
+		goto err_disable_in;
 	}
+
+	//spin_lock_irqsave(&mctp->lock, flags);
+	//skb = __skb_dequeue(&mctp->skb_free_list);
+	//spin_unlock_irqrestore(&mctp->lock, flags);
+
+	//if (!skb)
+	skb = netdev_alloc_skb(mctp->dev, MCTP_USB_XFER_SIZE);
+
+	if (!skb)
+		goto err_free_req;
+
+	out_req->context = skb;
+	out_req->buf = skb->data;
+	out_req->complete = mctp_usbg_out_ep_complete;
+
+	rc = usb_ep_queue(mctp->out_ep, out_req, GFP_ATOMIC);
+	if (rc) {
+		ERROR(cdev, "%s: out req queue failed %d\b", __func__, rc);
+		goto err_free_skb;
+	}
+
+	/* todo: and just one in the in queue too */
+	in_req = usb_ep_alloc_request(mctp->in_ep, GFP_ATOMIC);
+	if (!in_req) {
+		ERROR(cdev, "%s: out req alloc failed\n", __func__);
+		goto err_disable_in;
+	}
+	in_req->complete = mctp_usbg_in_ep_complete;
+
+	/* spin_lock_irqsave(&mctp->lock, flags);
+	list_add(&in_req->list, &mctp->tx_reqs);
+	spin_unlock_irqrestore(&mctp->lock, flags); */
 
 	return 0;
 
+err_free_skb:
+	kfree_skb(skb);
+err_free_req:
+	free_ep_req(mctp->out_ep, out_req);
 err_disable_in:
 	usb_ep_disable(mctp->in_ep);
 err_disable_out:
 	usb_ep_disable(mctp->out_ep);
 
 	return rc;
+}
+
+static netdev_tx_t mctp_usbg_start_xmit(struct sk_buff *skb,
+					struct net_device *dev)
+{
+	struct f_mctp *mctp = netdev_priv(dev);
+	struct pcpu_dstats *dstats = this_cpu_ptr(mctp->dev->dstats);
+	struct mctp_usb_hdr *hdr;
+	unsigned long flags;
+	unsigned int plen;
+
+	if (mctp->dev != dev) {
+		pr_err("1:different dev pointer, mctp:%pX, original:%pX\n",
+		       mctp->dev, dev);
+	}
+
+	if (skb->len + sizeof(*hdr) > MCTP_USB_XFER_SIZE)
+		goto drop;
+
+	plen = skb->len;
+	hdr = skb_push(skb, sizeof(*hdr));
+	hdr->id = cpu_to_be16(MCTP_USB_DMTF_ID);
+	hdr->rsvd = 0;
+	hdr->len = plen + sizeof(*hdr);
+
+	spin_lock_irqsave(&mctp->lock, flags);
+	if (!mctp->tx_batch_delay) {
+		if (mctp->dev != dev) {
+			pr_err("2:different dev pointer, mctp:%pX, original:%pX\n",
+			       mctp->dev, dev);
+		}
+		/* direct tx */
+		__mctp_usbg_tx(mctp, skb);
+	} else {
+		unsigned int batch_len;
+
+		batch_len = __mctp_usbg_tx_batch_len(mctp);
+		if (batch_len + skb->len > MCTP_USB_XFER_SIZE)
+			__mctp_usbg_batch_tx(mctp);
+
+		__skb_queue_head(&mctp->tx_batch, skb);
+
+		schedule_delayed_work(&mctp->tx_batch_work,
+				      msecs_to_jiffies(mctp->tx_batch_delay));
+	}
+	spin_unlock_irqrestore(&mctp->lock, flags);
+	u64_stats_update_begin(&dstats->syncp);
+	u64_stats_inc(&dstats->tx_packets);
+	u64_stats_add(&dstats->tx_bytes, plen);
+	u64_stats_update_end(&dstats->syncp);
+
+	return NETDEV_TX_OK;
+
+drop:
+	kfree_skb(skb);
+	u64_stats_update_begin(&dstats->syncp);
+	u64_stats_inc(&dstats->tx_drops);
+	u64_stats_update_end(&dstats->syncp);
+	return NETDEV_TX_OK;
 }
 
 static int mctp_usbg_open(struct net_device *net)
@@ -387,6 +600,7 @@ static int mctp_usbg_stop(struct net_device *net)
 static const struct net_device_ops mctp_usbg_netdev_ops = {
 	.ndo_open = mctp_usbg_open,
 	.ndo_stop = mctp_usbg_stop,
+	.ndo_start_xmit = mctp_usbg_start_xmit,
 };
 
 static void __mctp_usbg_disable(struct f_mctp *mctp)
@@ -398,19 +612,6 @@ static void __mctp_usbg_disable(struct f_mctp *mctp)
 static void mctp_usbg_disable(struct usb_function *f)
 {
 	struct f_mctp *mctp = func_to_mctp(f);
-	struct usb_request *list, *next;
-	unsigned long flags;
-
-	if (mctp->out_ep) {
-		spin_lock_irqsave(&mctp->rx_spinlock, flags);
-		list_for_each_entry_safe(list, next, &mctp->free_rx_reqs,
-					 list) {
-			free_ep_req(mctp->out_ep, list);
-			list_del(&list->list);
-			kfree(list);
-		}
-		spin_unlock_irqrestore(&mctp->rx_spinlock, flags);
-	}
 
 	__mctp_usbg_disable(mctp);
 }
@@ -428,6 +629,7 @@ static int mctp_usbg_set_alt(struct usb_function *f, unsigned intf,
 static void mctp_usbg_free_func(struct usb_function *f)
 {
 	struct f_mctp *mctp = func_to_mctp(f);
+
 	kfree(mctp);
 }
 
@@ -460,17 +662,20 @@ mctp_usbg_alloc_func(struct usb_function_instance *fi)
 
 	dev = alloc_netdev(sizeof(*mctp), "mctpusbg%d", NET_NAME_ENUM,
 			   mctp_usbg_netdev_setup);
-
 	if (!dev)
 		return ERR_PTR(-ENOMEM);
 
 	mctp = netdev_priv(dev);
 	mctp->dev = dev;
+	mctp->tx_batch_delay = opts->tx_batch_delay;
 
-	//spin_lock_init(&mctp->tx_spinlock);
-	spin_lock_init(&mctp->rx_spinlock);
-	//INIT_LIST_HEAD(&mctp->free_tx_reqs);
-	INIT_LIST_HEAD(&mctp->free_rx_reqs);
+	spin_lock_init(&mctp->lock);
+	//INIT_LIST_HEAD(&mctp->rx_reqs);
+	//INIT_LIST_HEAD(&mctp->tx_reqs);
+	__skb_queue_head_init(&mctp->skb_free_list);
+	__skb_queue_head_init(&mctp->tx_batch);
+	//INIT_WORK(&mctp->prealloc_work, mctp_usbg_prealloc_work);
+	INIT_DELAYED_WORK(&mctp->tx_batch_work, mctp_usbg_batch_tx_work);
 
 	mctp->function.name = "mctp";
 	mctp->function.bind = mctp_usbg_bind;
@@ -478,6 +683,9 @@ mctp_usbg_alloc_func(struct usb_function_instance *fi)
 	mctp->function.disable = mctp_usbg_disable;
 	mctp->function.strings = mctp_usbg_gadget_strings;
 	mctp->function.free_func = mctp_usbg_free_func;
+
+	/* this will allocate our first pool of out (rx) skbs */
+	//mctp_usbg_prealloc(mctp);
 
 	rc = register_netdev(dev);
 	if (rc) {
@@ -515,6 +723,7 @@ static ssize_t mctp_usbg_tx_batch_delay_store(struct config_item *item,
 	rc = kstrtouint(page, 0, &tmp);
 	if (!rc)
 		opts->tx_batch_delay = tmp;
+
 	return rc;
 }
 
@@ -529,8 +738,8 @@ static ssize_t mctp_usbg_tx_batch_delay_show(struct config_item *item,
 CONFIGFS_ATTR(mctp_usbg_, tx_batch_delay);
 
 static struct configfs_attribute *mctp_usbg_attrs[] = {
-	[0] = &mctp_usbg_attr_tx_batch_delay,
-	[1] = NULL,
+	&mctp_usbg_attr_tx_batch_delay,
+	NULL,
 };
 
 static const struct config_item_type mctp_usbg_func_type = {
