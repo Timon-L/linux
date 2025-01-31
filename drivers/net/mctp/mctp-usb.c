@@ -7,7 +7,16 @@
 
 #include <uapi/linux/if_arp.h>
 
-#define MAX_TX_URB_LEN 8
+#define MAX_TX_URB_COUNT 8
+#define MCTP_USB_MAX_BULK_SIZE 1024
+
+struct mctp_usb_tx_context {
+	struct urb *urb;
+	struct sk_buff_head skbs;
+	char *buffer;
+	size_t filled;
+	struct list_head list;
+};
 struct mctp_usb {
 	struct usb_device *usbdev;
 	struct usb_interface *intf;
@@ -19,6 +28,9 @@ struct mctp_usb {
 
 	__u8 ep_in;
 	__u8 ep_out;
+
+	struct list_head active_contexts;
+	struct mcpt_usb_tx_context *current_ctx;
 };
 
 static void mctp_usb_stat_tx_dropped(struct net_device *dev)
@@ -42,6 +54,7 @@ static void mctp_usb_stat_tx_done(struct net_device *dev, unsigned int len)
 
 static void mctp_usb_out_complete(struct urb *urb)
 {
+	struct mctp_usb_tx_context *ctx = urb->context;
 	struct sk_buff *skb = urb->context;
 	struct net_device *netdev = skb->dev;
 	struct mctp_usb *mctp_usb = netdev_priv(netdev);
@@ -74,71 +87,92 @@ static void mctp_usb_out_complete(struct urb *urb)
 		break;
 	}
 
+	skb_queue_purge(&ctx->skbs);
+	kfree(ctx->buffer);
+
 	spin_lock_irqsave(&mctp_usb->tx_spinlock, flags);
 	if (list_empty(&mctp_usb->free_tx_urbs))
 		netif_wake_queue(netdev);
 	list_add_tail(&urb->urb_list, &mctp_usb->free_tx_urbs);
 	spin_unlock_irqrestore(&mctp_usb->tx_spinlock, flags);
 
-	kfree_skb(skb);
+	kfree(ctx);
 }
 
 static netdev_tx_t mctp_usb_start_xmit(struct sk_buff *skb,
 				       struct net_device *dev)
 {
 	struct mctp_usb *mctp_usb = netdev_priv(dev);
+	struct mctp_usb_tx_context *ctx = NULL;
 	struct mctp_usb_hdr *hdr;
-	unsigned int plen;
-	struct urb *tx_urb;
 	unsigned long flags;
 	int rc;
 
-	plen = skb->len;
+	spin_lock_irqsave(&mctp_usb->tx_spinlock, flags);
 
-	if (plen + sizeof(*hdr) > MCTP_USB_XFER_SIZE)
-		goto err_drop;
+	list_for_each_entry(ctx, &mctp_usb->active_contexts, list) {
+		if (ctx->filled + sizeof(*hdr) + skb->len <= MCTP_USB_XFER_SIZE)
+			break;
+		ctx = NULL;
+	}
 
-	hdr = skb_push(skb, sizeof(*hdr));
-	if (!hdr)
-		goto err_drop;
+	if (!ctx) {
+		if (list_empty(&mctp_usb->free_tx_urbs)) {
+			spin_unlock_irqrestore(&mctp_usb->tx_spinlock, flags);
+			return NETDEV_TX_BUSY;
+		}
 
+		ctx = kzalloc(sizeof(*ctx), GFP_ATOMIC);
+		if (!ctx)
+			goto err_drop;
+
+		ctx->buffer = kmalloc(MCTP_USB_XFER_SIZE, GFP_ATOMIC);
+		if (!ctx->buffer) {
+			kfree(ctx);
+			goto err_drop;
+		}
+
+		ctx->urb = list_first_entry(&mctp_usb->free_tx_urbs, struct urb,
+					    urb_list);
+		list_del(&ctx->urb->urb_list);
+		skb_queue_head_init(&ctx->skbs);
+		list_add_tail(&ctx->list, &mctp_usb->active_contexts);
+	}
+
+	hdr = (struct mctp_usb_hdr *)(ctx->buffer + ctx->filled);
 	hdr->id = cpu_to_be16(MCTP_USB_DMTF_ID);
 	hdr->rsvd = 0;
-	hdr->len = plen + sizeof(*hdr);
+	hdr->len = skb->len + sizeof(*hdr);
 
-	spin_lock_irqsave(&mctp_usb->tx_spinlock, flags);
-	tx_urb = list_first_entry_or_null(&mctp_usb->free_tx_urbs, struct urb,
-					  urb_list);
-	if (tx_urb) {
-		list_del(&tx_urb->urb_list);
-	} else {
-		spin_unlock_irqrestore(&mctp_usb->tx_spinlock, flags);
-		return NETDEV_TX_OK;
+	memcpy(ctx->buffer + ctx->filled + sizeof(*hdr), skb->data, skb->len);
+	ctx->filled += hdr->len;
+	skb_queue_tail(&ctx->skbs, skb);
+
+	if (ctx->filled >= MCTP_USB_XFER_SIZE) {
+		usb_fill_bulk_urb(
+			ctx->urb, mctp_usb->usbdev,
+			usb_sndbulkpipe(mctp_usb->usbdev, mctp_usb->ep_out),
+			ctx->buffer, ctx->filled, mctp_usb_out_complete, ctx);
+
+		rc = usb_submit_urb(ctx->urb, GFP_ATOMIC);
+		if (rc) {
+			skb_queue_purge(&ctx->skbs);
+			kfree(ctx->buffer);
+			list_add(&ctx->urb->urb_list, &mctp_usb->free_tx_urbs);
+			list_del(&ctx->list);
+			kfree(ctx);
+			goto err_drop;
+		}
+
+		list_del(&ctx->list);
 	}
 
-	if (list_empty(&mctp_usb->free_tx_urbs))
-		netif_stop_queue(dev);
 	spin_unlock_irqrestore(&mctp_usb->tx_spinlock, flags);
-
-	usb_fill_bulk_urb(tx_urb, mctp_usb->usbdev,
-			  usb_sndbulkpipe(mctp_usb->usbdev, mctp_usb->ep_out),
-			  skb->data, skb->len, mctp_usb_out_complete, skb);
-
-	rc = usb_submit_urb(tx_urb, GFP_ATOMIC);
-	if (rc) {
-		printk("failed to submit");
-		spin_lock_irqsave(&mctp_usb->tx_spinlock, flags);
-		if (list_empty(&mctp_usb->free_tx_urbs))
-			netif_wake_queue(dev);
-		list_add_tail(&tx_urb->urb_list, &mctp_usb->free_tx_urbs);
-		spin_unlock_irqrestore(&mctp_usb->tx_spinlock, flags);
-		goto err_drop;
-	}
-
 	return NETDEV_TX_OK;
 
 err_drop:
 	printk("Msg dropped");
+	spin_unlock_irqrestore(&mctp_usb->tx_spinlock, flags);
 	mctp_usb_stat_tx_dropped(dev);
 	kfree_skb(skb);
 	return NETDEV_TX_OK;
@@ -214,7 +248,7 @@ static int mctp_usb_probe(struct usb_interface *intf,
 	INIT_LIST_HEAD(&dev->free_tx_urbs);
 
 	spin_lock_irqsave(&dev->tx_spinlock, flags);
-	for (int i = 0; i < MAX_TX_URB_LEN; i++) {
+	for (int i = 0; i < MAX_TX_URB_COUNT; i++) {
 		struct urb *tx_urb = usb_alloc_urb(0, GFP_KERNEL);
 		if (!tx_urb) {
 			rc = -ENOMEM;
