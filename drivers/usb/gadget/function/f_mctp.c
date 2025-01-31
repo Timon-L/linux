@@ -203,6 +203,8 @@ static void mctp_usbg_out_ep_complete(struct usb_ep *ep,
 	struct usb_composite_dev *cdev = mctp->function.config->cdev;
 	unsigned long flags;
 	int rc;
+	LIST_HEAD(local_list);
+	struct usb_request *tmp;
 
 	switch (req->status) {
 	case 0:
@@ -210,30 +212,26 @@ static void mctp_usbg_out_ep_complete(struct usb_ep *ep,
 
 		spin_lock_irqsave(&mctp->rx_spinlock, flags);
 		list_add_tail(&req->list, &mctp->free_rx_reqs);
+
+		list_for_each_entry_safe(req, tmp, &mctp->free_rx_reqs, list) {
+			list_move_tail(&req->list, &local_list);
+		}
 		spin_unlock_irqrestore(&mctp->rx_spinlock, flags);
 
-		spin_lock_irqsave(&mctp->rx_spinlock, flags);
-		if (!list_empty(&mctp->free_rx_reqs)) {
-			struct usb_request *next_req = list_first_entry(
-				&mctp->free_rx_reqs, struct usb_request, list);
-
-			list_del(&next_req->list);
-			spin_unlock_irqrestore(&mctp->rx_spinlock, flags);
-
-			rc = mctp_rx_submit(mctp, ep, next_req);
-			if (rc < 0) {
+		list_for_each_entry_safe(req, tmp, &local_list, list) {
+			rc = mctp_rx_submit(mctp, ep, req);
+			if (rc) {
 				ERROR(cdev, "resubmit failed\n");
-				break;
+				goto err_submit;
 			}
-		} else {
-			printk("%s: list is empty", __func__);
-			spin_unlock_irqrestore(&mctp->rx_spinlock, flags);
+
+			list_del_init(&req->list);
 		}
 		return;
 	case -ESHUTDOWN:
 		printk("%s: ESHUTDOWN", __func__);
 		kfree_skb(req->context);
-		break;
+		return;
 	case -ECONNRESET:
 	case -ECONNABORTED:
 	default:
@@ -243,6 +241,14 @@ static void mctp_usbg_out_ep_complete(struct usb_ep *ep,
 
 	spin_lock_irqsave(&mctp->rx_spinlock, flags);
 	list_add_tail(&req->list, &mctp->free_rx_reqs);
+	spin_unlock_irqrestore(&mctp->rx_spinlock, flags);
+	return;
+
+err_submit:
+	spin_lock_irqsave(&mctp->rx_spinlock, flags);
+	list_for_each_entry_safe(req, tmp, &local_list, list) {
+		list_move_tail(&req->list, &mctp->free_rx_reqs);
+	}
 	spin_unlock_irqrestore(&mctp->rx_spinlock, flags);
 }
 
