@@ -23,6 +23,8 @@ struct mctp_usb {
 	__u8 ep_in;
 	__u8 ep_out;
 
+	struct urb *tx_urb;
+	struct urb *rx_urb;
 };
 
 static void mctp_usb_stat_tx_dropped(struct net_device *dev)
@@ -87,48 +89,39 @@ static netdev_tx_t mctp_usb_start_xmit(struct sk_buff *skb,
 	struct mctp_usb *mctp_usb = netdev_priv(dev);
 	struct mctp_usb_hdr *hdr;
 	unsigned int plen;
-	struct urb *tx_urb;
 	int rc;
 
 	plen = skb->len;
 
 	if (plen + sizeof(*hdr) > MCTP_USB_XFER_SIZE) {
 		printk("Plen error");
-		goto err_drop_no_urb;
+		goto err_drop;
 	}
 
 	hdr = skb_push(skb, sizeof(*hdr));
 	if (!hdr) {
 		printk("hdr error");
-		goto err_drop_no_urb;
+		goto err_drop;
 	}
 
 	hdr->id = cpu_to_be16(MCTP_USB_DMTF_ID);
 	hdr->rsvd = 0;
 	hdr->len = plen + sizeof(*hdr);
 
-	tx_urb = usb_alloc_urb(0, GFP_KERNEL);
-	if(!tx_urb) {
-		pr_warn("%s alloc urb err", __func__);
-		goto err_drop_no_urb;
-	}
-
-	usb_fill_bulk_urb(tx_urb, mctp_usb->usbdev,
+	usb_fill_bulk_urb(mctp_usb->tx_urb, mctp_usb->usbdev,
 			  usb_sndbulkpipe(mctp_usb->usbdev, mctp_usb->ep_out),
 			  skb->data, skb->len, mctp_usb_out_complete, skb);
 
-	rc = usb_submit_urb(tx_urb, GFP_ATOMIC);
+	rc = usb_submit_urb(mctp_usb->tx_urb, GFP_ATOMIC);
 	if (rc)
 		goto err_drop;
 	else
 		netif_stop_queue(dev);
 
-	usb_free_urb(tx_urb);
 	return NETDEV_TX_OK;
 
 err_drop:
-	usb_free_urb(tx_urb);
-err_drop_no_urb:
+	printk("msg dropped");
 	mctp_usb_stat_tx_dropped(dev);
 	kfree_skb(skb);
 	return NETDEV_TX_OK;
@@ -147,7 +140,7 @@ static int mctp_usb_rx_queue(struct mctp_usb *mctp_usb)
 		return -ENOMEM;
 
 	rx_urb = usb_alloc_urb(0, GFP_KERNEL);
-	if(!rx_urb) {
+	if (!rx_urb) {
 		pr_warn("%s alloc urb err", __func__);
 		goto err_drop_no_urb;
 	}
@@ -290,8 +283,8 @@ static void mctp_usb_netdev_setup(struct net_device *dev)
 {
 	dev->type = ARPHRD_MCTP;
 
-	dev->mtu = MCTP_USB_MTU_MIN;
-	dev->min_mtu = MCTP_USB_MTU_MIN;
+	dev->mtu = 1500;
+	dev->min_mtu = 1500;
 	dev->max_mtu = MCTP_USB_MTU_MAX;
 	dev->tx_queue_len = 1100;
 
@@ -335,13 +328,13 @@ static int mctp_usb_probe(struct usb_interface *intf,
 	dev->ep_in = ep_in->bEndpointAddress;
 	dev->ep_out = ep_out->bEndpointAddress;
 
-	/* dev->tx_urb = usb_alloc_urb(0, GFP_KERNEL);
+	dev->tx_urb = usb_alloc_urb(0, GFP_KERNEL);
 	dev->rx_urb = usb_alloc_urb(0, GFP_KERNEL);
 	if (!dev->tx_urb || !dev->rx_urb) {
 		rc = -ENOMEM;
 		goto err_free_urbs;
 	}
- */
+
 	rc = register_netdev(netdev);
 	if (rc)
 		goto err_free_urbs;
@@ -349,8 +342,8 @@ static int mctp_usb_probe(struct usb_interface *intf,
 	return 0;
 
 err_free_urbs:
-	/* usb_free_urb(dev->tx_urb);
-	usb_free_urb(dev->rx_urb); */
+	usb_free_urb(dev->tx_urb);
+	usb_free_urb(dev->rx_urb);
 	free_netdev(netdev);
 	return rc;
 }

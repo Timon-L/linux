@@ -1,3 +1,4 @@
+#include <linux/time.h>
 #include <linux/kernel.h>
 #include <linux/usb/composite.h>
 #include <linux/netdevice.h>
@@ -11,7 +12,7 @@
 
 #include <linux/usb/func_utils.h>
 
-#define MAX_REQS_LEN 10
+#define MAX_REQS_LEN 16
 
 struct f_mctp {
 	struct usb_function function;
@@ -219,13 +220,14 @@ static void mctp_usbg_out_ep_complete(struct usb_ep *ep,
 		spin_unlock_irqrestore(&mctp->rx_spinlock, flags);
 
 		list_for_each_entry_safe(req, tmp, &local_list, list) {
+			list_del_init(&req->list);
+
 			rc = mctp_rx_submit(mctp, ep, req);
 			if (rc) {
 				ERROR(cdev, "resubmit failed\n");
+				list_add_tail(&req->list, &local_list);
 				goto err_submit;
 			}
-
-			list_del_init(&req->list);
 		}
 		return;
 	case -ESHUTDOWN:
@@ -376,9 +378,10 @@ static void mctp_usbg_netdev_setup(struct net_device *dev)
 {
 	dev->type = ARPHRD_MCTP;
 
-	dev->mtu = MCTP_USB_MTU_MIN;
-	dev->min_mtu = MCTP_USB_MTU_MIN;
+	dev->mtu = 1500;
+	dev->min_mtu = 1500;
 	dev->max_mtu = MCTP_USB_MTU_MAX;
+
 
 	dev->hard_header_len = 0;
 	dev->addr_len = 0;
@@ -408,9 +411,7 @@ mctp_usbg_alloc_func(struct usb_function_instance *fi)
 	mctp = netdev_priv(dev);
 	mctp->dev = dev;
 
-	//spin_lock_init(&mctp->tx_spinlock);
 	spin_lock_init(&mctp->rx_spinlock);
-	//INIT_LIST_HEAD(&mctp->free_tx_reqs);
 	INIT_LIST_HEAD(&mctp->free_rx_reqs);
 
 	mctp->function.name = "mctp";
